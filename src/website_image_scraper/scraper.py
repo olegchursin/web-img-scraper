@@ -1,9 +1,10 @@
 import os
+import re
 import time
 import random
 import logging
 import requests
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs, unquote
 from bs4 import BeautifulSoup
 
 # Configure logging
@@ -45,13 +46,6 @@ class WebsiteScraper:
             'Upgrade-Insecure-Requests': '1'
         }
 
-    def rate_limit(self):
-        """
-        Implement rate limiting with random delay between requests.
-        """
-        delay = random.uniform(self.min_delay, self.max_delay)
-        time.sleep(delay)
-
     def is_valid_url(self, url):
         """
         Check if the URL is valid and belongs to the same domain.
@@ -64,20 +58,82 @@ class WebsiteScraper:
             logging.error(f"Error validating URL {url}: {e}")
             return False
 
-    def download_image(self, image_url):
+    def extract_actual_image_url(self, image_url):
         """
-        Download an image from a given URL with retry mechanism.
+        Extract the actual image URL from various dynamic serving mechanisms.
         """
+        # Parse the URL
+        parsed_url = urlparse(image_url)
+
+        # Handle query parameter image sources
+        if parsed_url.query:
+            query_params = parse_qs(parsed_url.query)
+
+            # Check for common image source parameters
+            image_params = ['src', 'source', 'img', 'image', 'url']
+            for param in image_params:
+                if param in query_params:
+                    # Decode and get the first match
+                    actual_url = unquote(query_params[param][0])
+
+                    # If it's a relative URL, make it absolute
+                    if not actual_url.startswith(('http://', 'https://')):
+                        actual_url = urljoin(self.base_url, actual_url)
+
+                    return actual_url
+
+        # If no query parameter works, return the original URL
+        return image_url
+
+    def to_dash_case(self, text):
+        """
+        Convert a string to dash-case (kebab-case).
+        Removes non-alphanumeric characters and converts to lowercase.
+        """
+        if not text:
+            return ""
+
+        # Remove non-alphanumeric characters and replace with dash
+        text = re.sub(r'[^a-zA-Z0-9]+', '-', text)
+
+        # Remove leading/trailing dashes and convert to lowercase
+        return text.strip('-').lower()
+
+    def generate_filename(self, image_url, img_element):
+        """
+        Generate a filename for the image based on title or URL.
+        """
+        # Try to get title attribute
+        title = img_element.get('title')
+
+        # If title exists, convert to dash-case
+        if title:
+            dash_title = self.to_dash_case(title)
+            if dash_title:
+                # Get file extension from the original image URL
+                file_ext = os.path.splitext(
+                    urlparse(image_url).path)[1] or '.jpg'
+                return f"{dash_title}{file_ext}"
+
+        # Fallback to URL-based filename
+        return os.path.basename(urlparse(image_url).path).replace('/', '_')
+
+    def download_image(self, image_url, img_element):
+        """
+        Download an image from a given URL with retry mechanism and URL extraction.
+        """
+        # First, try to extract the actual image URL
+        actual_image_url = self.extract_actual_image_url(image_url)
+
         for attempt in range(self.max_retries):
             try:
                 # Apply rate limiting before each request
-                self.rate_limit()
+                time.sleep(random.uniform(self.min_delay, self.max_delay))
 
                 response = requests.get(
-                    image_url,
+                    actual_image_url,
                     headers=self.headers,
                     timeout=10,
-                    # Ignore SSL verification issues
                     verify=False
                 )
 
@@ -85,15 +141,14 @@ class WebsiteScraper:
                 content_type = response.headers.get('Content-Type', '').lower()
                 if 'image' not in content_type:
                     logging.warning(f"Not an image: {
-                                    image_url}. Content-Type: {content_type}")
+                                    actual_image_url}. Content-Type: {content_type}")
                     return
 
                 if response.status_code == 200:
-                    # Generate a unique filename
+                    # Generate a unique filename using title or URL
                     filename = os.path.join(
                         self.output_dir,
-                        os.path.basename(
-                            urlparse(image_url).path).replace('/', '_')
+                        self.generate_filename(actual_image_url, img_element)
                     )
 
                     # Prevent overwriting by adding a number if file exists
@@ -106,22 +161,23 @@ class WebsiteScraper:
                     # Save the image
                     with open(filename, 'wb') as f:
                         f.write(response.content)
-                    logging.info(f"Downloaded: {image_url}")
+                    logging.info(f"Downloaded: {
+                                 actual_image_url} (Filename: {filename})")
                     return
 
                 # If status code is not 200, wait and retry
-                logging.warning(f"Failed to download {image_url}. Status code: {
+                logging.warning(f"Failed to download {actual_image_url}. Status code: {
                                 response.status_code}")
                 time.sleep(1)
 
             except requests.RequestException as e:
-                logging.error(f"Error downloading {image_url} (Attempt {
+                logging.error(f"Error downloading {actual_image_url} (Attempt {
                               attempt + 1}/{self.max_retries}): {e}")
 
                 # Wait longer between retry attempts
                 time.sleep(2 ** attempt)
 
-        logging.error(f"Failed to download {image_url} after {
+        logging.error(f"Failed to download {actual_image_url} after {
                       self.max_retries} attempts")
 
     def crawl(self, url=None, depth=3):
@@ -142,14 +198,13 @@ class WebsiteScraper:
 
         try:
             # Apply rate limiting before each request
-            self.rate_limit()
+            time.sleep(random.uniform(self.min_delay, self.max_delay))
 
             # Fetch the webpage with more robust request
             response = requests.get(
                 url,
                 headers=self.headers,
                 timeout=10,
-                # Ignore SSL verification issues
                 verify=False
             )
 
@@ -170,7 +225,7 @@ class WebsiteScraper:
                     # Convert relative URLs to absolute
                     full_img_url = urljoin(url, img_url)
                     if self.is_valid_url(full_img_url):
-                        self.download_image(full_img_url)
+                        self.download_image(full_img_url, img)
 
             # Find all links on the page
             links = soup.find_all('a', href=True)
@@ -194,7 +249,7 @@ def main():
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    base_url = 'https://url.com'
+    base_url = 'https://www.unionsquarewines.com/spirits/?page=1&sortby=sort_item_order&l=100&item_type=spirits'
     scraper = WebsiteScraper(
         base_url,
         min_delay=1,    # Minimum 1 second between requests
